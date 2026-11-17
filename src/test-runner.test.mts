@@ -4,7 +4,16 @@ import type { TestContext } from "node:test";
 
 import { createMockResources, type MockPage, type MockResources } from "./mock-resources.mjs";
 import { TEST_DATA, type TestData } from "./test-data.mjs";
-import type { TestInfo, TestResult, TestRunner, TestSuite, WithTestData } from "./test-runner.mjs";
+import type {
+  DefaultDataConfig,
+  FallbackTestRunner,
+  FallbackTestSuite,
+  TestInfo,
+  TestResult,
+  TestRunner,
+  TestSuite,
+  WithTestData,
+} from "./test-runner.mjs";
 import { createTestRunner } from "./test-runner.mjs";
 
 await test("interleaved handles share registration order and keep their options and types", async (t: TestContext): Promise<void> => {
@@ -126,6 +135,154 @@ await test("interleaved handles share registration order and keep their options 
   assert.deepEqual(started, titles);
   assert.equal(loads, rounds);
   assert.deepEqual(await suite.run(), []);
+});
+
+await test("a root data ID is inherited and an override reaches earlier providers", async (): Promise<void> => {
+  interface Resources {
+    readonly factoryInfo: TestInfo;
+  }
+  type Context = WithTestData<Resources>;
+  type Extended = Context & { readonly providerPath: string };
+  const loads: string[] = [];
+  const starts: string[] = [];
+  const options = { isHeadless: true, willAttachConsole: true };
+  const config: DefaultDataConfig<Resources> = {
+    createResources: (info: TestInfo): Resources => {
+      starts.push(info.title);
+      return { factoryInfo: info };
+    },
+    dataId: "Default",
+    loadTestData: (id: string, info: TestInfo): TestData => {
+      assert.equal(id, info.dataId);
+      loads.push(`${info.title}:${id}:${info.isHeadless}:${info.willAttachConsole}`);
+      return { codemarkPath: id, snapshots: [] };
+    },
+    options,
+  };
+  const suite: FallbackTestSuite<Context> = createTestRunner.withDefaultData<Resources>(config);
+  options.isHeadless = false;
+  const derived: FallbackTestRunner<Extended> = suite.extend(
+    ({ testData, factoryInfo }: Readonly<Context>, info: TestInfo): { providerPath: string } => {
+      assert.strictEqual(factoryInfo, info);
+      assert.equal(testData.codemarkPath, info.dataId);
+      return { providerPath: testData.codemarkPath };
+    },
+  );
+  const custom: TestRunner<Extended> = derived
+    .configure({ isHeadless: false })
+    .withData("Other")
+    .configure({ willAttachConsole: false });
+  function checkBody({ factoryInfo, testData, providerPath }: Extended): void {
+    assert.equal(factoryInfo.dataId, testData.codemarkPath);
+    assert.equal(providerPath, testData.codemarkPath);
+  }
+  suite("root", ({ testData }: Context): void => {
+    assert.equal(testData.codemarkPath, "Default");
+  });
+  custom("custom", checkBody);
+  derived("sibling", checkBody);
+  custom("custom again", checkBody);
+  assert.throws(
+    // @ts-expect-error An explicit replacement has already selected the ID on this branch.
+    (): TestRunner<WithTestData<Extended>> => custom.withData("third"),
+    // biome-ignore lint/performance/useTopLevelRegex: OK
+    /already selected/,
+  );
+  assert.deepEqual(loads, []);
+  assert.deepEqual(starts, []);
+  const results: readonly TestResult[] = await suite.run();
+  assert.deepEqual(
+    results.filter((result: TestResult): boolean => result.status === "failed"),
+    [],
+  );
+  assert.deepEqual(loads, [
+    "root:Default:true:true",
+    "custom:Other:false:false",
+    "sibling:Default:true:true",
+    "custom again:Other:false:false",
+  ]);
+  assert.deepEqual(starts, ["root", "custom", "sibling", "custom again"]);
+});
+
+await test("only the effective ID is validated before resource setup", async (): Promise<void> => {
+  const loads: string[] = [];
+  const starts: string[] = [];
+  const suite: FallbackTestSuite<WithTestData<object>> = createTestRunner.withDefaultData({
+    createResources: ({ title }: TestInfo): object => {
+      starts.push(title);
+      return {};
+    },
+    dataId: "missing default",
+    loadTestData: (id: string): Promise<TestData | undefined> => {
+      loads.push(id);
+      return Promise.resolve(
+        id === "" ? { codemarkPath: "empty-id.json", snapshots: [] } : undefined,
+      );
+    },
+  });
+  // oxlint-disable-next-line unicorn/consistent-function-scoping
+  const unexpectedBody: () => never = (): never => assert.fail("body ran with unknown data");
+  suite("bad default", unexpectedBody);
+  suite.withData("missing override")("bad override", unexpectedBody);
+  suite.withData("")("valid override", ({ testData }: WithTestData<object>): void => {
+    assert.equal(testData.codemarkPath, "empty-id.json");
+  });
+
+  const [badDefault, badOverride, passed] = await suite.run();
+  assert.ok(badDefault?.status === "failed" && badDefault.error instanceof Error);
+  assert.equal(
+    badDefault.error.message,
+    'Unknown test data ID "missing default" in test "bad default".',
+  );
+  assert.ok(badOverride?.status === "failed" && badOverride.error instanceof Error);
+  assert.equal(
+    badOverride.error.message,
+    'Unknown test data ID "missing override" in test "bad override".',
+  );
+  assert.equal(passed?.status, "passed");
+  assert.deepEqual(loads, ["missing default", "missing override", ""]);
+  assert.deepEqual(starts, ["valid override"]);
+});
+
+await test("initial options alone keep a plain context and fallback data remains additive", async (): Promise<void> => {
+  const options = { isHeadless: true };
+  interface Resources {
+    readonly isHeadless: boolean | undefined;
+  }
+  const plain: TestSuite<Resources> = createTestRunner({
+    createResources: ({ isHeadless }: TestInfo): Resources => ({ isHeadless }),
+    loadTestData: (): never => assert.fail("lookup on a plain test"),
+    options,
+  });
+  options.isHeadless = false;
+  plain("plain", (context: Resources): void => {
+    assert.equal(context.isHeadless, true);
+    // @ts-expect-error Configuring options alone does not supply testData.
+    assert.equal(context.testData, undefined);
+  });
+  assert.equal((await plain.run())[0]?.status, "passed");
+
+  const resource = { testData: 42 };
+  // oxlint-disable-next-line unicorn/consistent-function-scoping
+  const loadTestData: () => TestData = (): TestData => ({ codemarkPath: "fixture", snapshots: [] });
+
+  createTestRunner.withDefaultData({
+    createResources: (): typeof resource => resource,
+    // @ts-expect-error Fallback data cannot replace a statically known resource key.
+    dataId: "Default",
+    loadTestData,
+  });
+  const hidden: FallbackTestSuite<WithTestData<object>> = createTestRunner.withDefaultData({
+    createResources: (): Record<string, unknown> => resource,
+    // @ts-expect-error Fallback data cannot replace a statically known resource key.
+    dataId: "Default",
+    loadTestData,
+  });
+  hidden.withData("Other")("collision", (): never => assert.fail("body ran after a collision"));
+  const [collision] = await hidden.run();
+  assert.ok(collision?.status === "failed" && collision.error instanceof Error);
+  // biome-ignore lint/performance/useTopLevelRegex: OK
+  assert.match(collision.error.message, /already contains the key "testData"/);
 });
 
 await test("missing data skips setup and a partial provider failure unwinds every acquisition", async (): Promise<void> => {

@@ -38,4 +38,5 @@ export const TEST_DATA: ReadonlyMap<string, TestData> = new Map([
       ],
     },
   ],
+  ["NoSnapshots", { codemarkPath: path.join(defaultDir, "codemark.json"), snapshots: [] }],
 ]);
