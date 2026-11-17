@@ -1,0 +1,14 @@
+{
+  "name": "eager-test-runner-tutorial",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "example": "npm run build && node dist/example.mjs",
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.1.0-dev.20261116.1",
+  }
+}
