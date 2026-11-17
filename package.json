@@ -6,9 +6,10 @@
   "scripts": {
     "build": "tsc --project tsconfig.json",
     "example": "npm run build && node dist/example.mjs",
+    "test": "npm run build && node --test dist/test-runner.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
-    "typescript": "^7.1.0-dev.20261116.1",
+    "typescript": "^7.1.0-dev.20261116.1"
   }
 }

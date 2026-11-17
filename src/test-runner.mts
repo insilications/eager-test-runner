@@ -20,9 +20,9 @@ export class ResourceScope {
    * causing its cleanup to be registered too late to execute.
    *
    * The test runner guarantees this ordering by awaiting resource
-   * initialization before disposing of the scope. Resource factories
-   * must therefore await all acquisitions instead of launching them
-   * as detached asynchronous operations.
+   * initialization before disposing of the scope. Both resource factories
+   * and extension providers must settle their acquisitions before they
+   * return or throw.
    *
    * If initialization fails after partially acquiring a resource,
    * the initializer is responsible for cleaning up that partial state.
@@ -52,7 +52,7 @@ export class ResourceScope {
     const errors: unknown[] = [];
 
     while (this.#cleanups.length > 0) {
-      const cleanup = this.#cleanups.pop();
+      const cleanup: (() => void | Promise<void>) | undefined = this.#cleanups.pop();
 
       if (cleanup === undefined) {
         break;
@@ -74,100 +74,154 @@ export type TestResult =
   | Readonly<{ title: string; status: "passed"; durationMS: number }>
   | Readonly<{ title: string; status: "failed"; durationMS: number; error: unknown }>;
 
-export interface TestOptions {
-  readonly dataId: string;
+export interface RunnerOptions {
+  readonly isHeadless?: boolean;
+  readonly willAttachConsole?: boolean;
 }
 
-export type TestBody<Context> = (context: Context) => void | Promise<void>;
-export type WithTestData<Resources> = Resources & { readonly testData: TestData };
-
-type ResourceFactory<Resources extends object> = (
-  scope: ResourceScope,
-  testOptions?: TestOptions,
-) => Resources | Promise<Resources>;
-
-/** Overloaded callable with a separate execution phase. */
-export interface TestFunction<Resources extends object> {
-  run: () => Promise<readonly TestResult[]>;
-  (title: string, callback: TestBody<Resources>): void;
-  (title: string, testOptions: TestOptions, callback: TestBody<WithTestData<Resources>>): void;
-}
-
-interface RegisteredTest<Resources extends object> {
-  readonly execute: (resources: Resources, testData: TestData | undefined) => void | Promise<void>;
-  readonly testOptions?: TestOptions;
+/** Final options and the resource scope for this particular test execution. */
+export interface TestInfo extends RunnerOptions {
+  readonly dataId: string | undefined;
+  readonly scope: ResourceScope;
   readonly title: string;
 }
 
-/** Create an isolated test registry, sharing one eager resource factory per test. */
+type Awaitable<T> = T | Promise<T>;
+export type TestBody<Context> = (context: Context) => Awaitable<void>;
+export type WithTestData<Context> = Context & { readonly testData: TestData };
+
+// A provider may only return new fields, even when an existing field has the same type.
+type Provider<Context, Extra extends object> = (
+  context: Readonly<Context>,
+  info: TestInfo,
+) => Awaitable<Extra & { [Key in keyof Context]?: never }>;
+
+export interface TestRunner<Context extends object> {
+  readonly configure: (options: RunnerOptions) => TestRunner<Context>;
+  readonly extend: <Extra extends object>(
+    provide: Provider<Context, Extra>,
+  ) => TestRunner<Context & Extra>;
+  readonly withData: (
+    dataId: "testData" extends keyof Context ? never : string,
+  ) => TestRunner<WithTestData<Context>>;
+  (title: string, body: TestBody<Context>): void;
+}
+
+export interface TestSuite<Context extends object> extends TestRunner<Context> {
+  readonly run: () => Promise<readonly TestResult[]>;
+}
+
+type ResolveContext<Context> = (info: TestInfo) => Awaitable<Context>;
+
+export interface TestRunnerConfig<Resources extends object> {
+  readonly createResources: ResolveContext<Resources>;
+  readonly loadTestData: (dataId: string, info: TestInfo) => Awaitable<TestData | undefined>;
+}
+
+interface RegisteredTest {
+  readonly execute: (scope: ResourceScope) => Promise<void>;
+  readonly title: string;
+}
+
+/** Contexts are records of own enumerable fields. Their values can be arbitrary resources. */
+function addFields<Context extends object, Extra extends object>(
+  context: Context,
+  extra: Extra,
+): Context & Extra {
+  // Types can hide fields, e.g. when a provider reads a dynamic key.
+  for (const key of Reflect.ownKeys(extra)) {
+    if (Object.hasOwn(context, key)) {
+      throw new Error(`Test context already contains the key "${String(key)}".`);
+    }
+  }
+  return { ...context, ...extra };
+}
+
+/** One queue per suite. Each immutable handle captures its own recipe for a test context. */
 export function createTestRunner<Resources extends object>(
-  createResources: ResourceFactory<Resources>,
-  testDataRegistry: ReadonlyMap<string, TestData>,
-): TestFunction<Resources> {
-  const registry: RegisteredTest<Resources>[] = [];
+  config: TestRunnerConfig<Resources>,
+): TestSuite<Resources> {
+  const registry: RegisteredTest[] = [];
   let isRunning: boolean = false;
 
-  function test(title: string, callback: TestBody<Resources>): void;
+  function build<Context extends object>(
+    resolveContext: ResolveContext<Context>,
+    options: RunnerOptions,
+    dataId?: string,
+  ): TestRunner<Context> {
+    console.debug(`Building test runner with data ID: ${dataId} and options:`, options);
+    function register(title: string, body: TestBody<Context>): void {
+      // Capture the resolver and its matching body while Context is still known.
+      registry.push({
+        execute: async (scope: ResourceScope): Promise<void> => {
+          const info: TestInfo = Object.freeze({ ...options, dataId, scope, title });
+          console.debug(
+            `Running test: "${title}" with data ID: "${dataId ?? "none"}" and options:`,
+            options,
+          );
+          const resolvedContext: Awaited<Context> = await resolveContext(info);
 
-  function test(
-    title: string,
-    testOptions: TestOptions,
-    callback: TestBody<WithTestData<Resources>>,
-  ): void;
-  function test(
-    title: string,
-    testOptionsOrCallback: TestOptions | TestBody<Resources>,
-    callbackWithData?: TestBody<WithTestData<Resources>>,
-  ): void {
-    if (typeof testOptionsOrCallback === "function") {
-      registry.push({ execute: testOptionsOrCallback, title });
-      return;
+          await body(resolvedContext);
+        },
+        title,
+      });
     }
 
-    if (callbackWithData === undefined) {
-      throw new TypeError(`Test "${title}" needs a callback.`);
+    function configure(overrides: RunnerOptions): TestRunner<Context> {
+      return build(resolveContext, { ...options, ...overrides }, dataId);
     }
 
-    registry.push({
-      execute: (resources: Resources, testData: TestData | undefined): void | Promise<void> => {
-        // run() has resolved this ID before resource initialization.
-        if (testData === undefined) {
-          throw new Error(`Test data "${testOptionsOrCallback.dataId}" was not resolved.`);
-        }
-        return callbackWithData({ ...resources, testData });
-      },
-      testOptions: testOptionsOrCallback,
-      title,
-    });
+    function extend<Extra extends object>(
+      provide: Provider<Context, Extra>,
+    ): TestRunner<Context & Extra> {
+      return build<Context & Extra>(
+        async (info: TestInfo): Promise<Context & Extra> => {
+          const context: Awaited<Context> = await resolveContext(info);
+          const extra: Extra & { [Key in keyof Context]?: never } = await provide(context, info);
+          return addFields<Context, Extra>(context, extra);
+        },
+        options,
+        dataId,
+      );
+    }
+
+    function withData(id: string): TestRunner<WithTestData<Context>> {
+      if (dataId !== undefined) {
+        throw new Error(`Test data "${dataId}" is already selected on this runner.`);
+      }
+      return build<WithTestData<Context>>(
+        async (info: TestInfo): Promise<Awaited<Context> & { testData: TestData }> => {
+          // An unknown ID must fail before base resources or earlier extensions run.
+          const testData: TestData | undefined = await config.loadTestData(id, info);
+          if (testData === undefined) {
+            throw new Error(`Unknown test data ID "${id}" in test "${info.title}".`);
+          }
+          return addFields(await resolveContext(info), { testData });
+        },
+        options,
+        id,
+      );
+    }
+
+    return Object.assign(register, { configure, extend, withData });
   }
 
-  async function runOne(item: RegisteredTest<Resources>): Promise<TestResult> {
+  async function runOne(item: RegisteredTest): Promise<TestResult> {
     const startedAt: number = performance.now();
     const scope = new ResourceScope();
     const errors: unknown[] = [];
 
     try {
-      // Look up metadata first; no snapshot file contents are loaded.
-      const testData: TestData | undefined =
-        item.testOptions === undefined ? undefined : testDataRegistry.get(item.testOptions.dataId);
-      if (item.testOptions !== undefined && testData === undefined) {
-        throw new Error(
-          `Unknown test data ID "${item.testOptions.dataId}" in test "${item.title}".`,
-        );
-      }
-
-      // All resources initialize, regardless of callback destructuring.
-      const resources: Awaited<Resources> = await createResources(scope, item.testOptions);
-      console.log(
-        `1 Running test: "${item.title}" with data ID: "${item.testOptions?.dataId ?? "none"}"`,
-      );
-      await item.execute(resources, testData);
+      await item.execute(scope);
     } catch (err: unknown) {
       // An error can be literally `undefined`, so use the array length.
       errors.push(err);
     } finally {
       // Includes resources successfully acquired before partial setup failure.
-      errors.push(...(await scope.dispose()));
+      // biome-ignore lint/nursery/noUnreadableForOfExpression: OK
+      for (const err of await scope.dispose()) {
+        errors.push(err);
+      }
     }
 
     const durationMS: number = performance.now() - startedAt;
@@ -190,13 +244,9 @@ export function createTestRunner<Resources extends object>(
     isRunning = true;
     try {
       // Tests registered during execution are retained for the *next* run.
-      const queued: RegisteredTest<Resources>[] = registry.splice(0);
+      const queued: RegisteredTest[] = registry.splice(0);
       const results: TestResult[] = [];
       for (const item of queued) {
-        console.log(
-          `0 Running test: "${item.title}" with data ID: "${item.testOptions?.dataId ?? "none"}"`,
-        );
-
         // oxlint-disable-next-line no-await-in-loop
         results.push(await runOne(item));
       }
@@ -207,5 +257,8 @@ export function createTestRunner<Resources extends object>(
     }
   }
 
-  return Object.assign(test, { run });
+  return Object.assign(
+    build((info: TestInfo): Awaitable<Resources> => config.createResources(info), {}),
+    { run },
+  );
 }

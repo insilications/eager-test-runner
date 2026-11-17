@@ -1,0 +1,318 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import type { TestContext } from "node:test";
+
+import { createMockResources, type MockPage, type MockResources } from "./mock-resources.mjs";
+import { TEST_DATA, type TestData } from "./test-data.mjs";
+import type { TestInfo, TestResult, TestRunner, TestSuite, WithTestData } from "./test-runner.mjs";
+import { createTestRunner } from "./test-runner.mjs";
+
+await test("interleaved handles share registration order and keep their options and types", async (t: TestContext): Promise<void> => {
+  t.mock.method(console, "log", (): void => {
+    /* noop */
+  });
+  const started: string[] = [];
+  let loads = 0;
+  const suite: TestSuite<{
+    isHeadless: boolean | undefined;
+    dataId: string | undefined;
+  }> = createTestRunner({
+    createResources: ({
+      title,
+      isHeadless,
+      dataId,
+    }: TestInfo): { dataId: string | undefined; isHeadless: boolean | undefined } => {
+      started.push(title);
+      return { dataId, isHeadless };
+    },
+    loadTestData: (id: string, opt: TestInfo): TestData | undefined => {
+      loads++;
+      assert.equal(opt.isHeadless, false);
+      return TEST_DATA.get(id);
+    },
+  });
+  const options = { isHeadless: true };
+  const headless: TestRunner<{
+    isHeadless: boolean | undefined;
+    dataId: string | undefined;
+  }> = suite.configure(options);
+  options.isHeadless = false;
+  const enriched: TestRunner<
+    {
+      isHeadless: boolean | undefined;
+      dataId: string | undefined;
+    } & {
+      readonly testData: TestData;
+    } & {
+      attachConsole: boolean | undefined;
+      path: string;
+    }
+  > = headless
+    .withData("Default")
+    .extend(
+      (
+        { testData }: { testData: TestData },
+        info: TestInfo,
+      ): { attachConsole: boolean | undefined; path: string } => ({
+        attachConsole: info.willAttachConsole,
+        path: testData.codemarkPath,
+      }),
+    )
+    .configure({ isHeadless: false, willAttachConsole: true });
+
+  // @ts-expect-error Only the root owns run().
+  assert.equal(enriched.run, undefined);
+  const rounds = 64;
+  const titles: string[] = [];
+  for (let i = 0; i < rounds; i++) {
+    titles.push(`base ${i}`, `headless ${i}`, `data ${i}`);
+    suite(
+      `base ${i}`,
+      (context: { isHeadless: boolean | undefined; dataId: string | undefined }): void => {
+        assert.equal(context.isHeadless, undefined);
+        // @ts-expect-error The base context has no testData field.
+        assert.equal(context.testData, undefined);
+      },
+    );
+    headless(
+      `headless ${i}`,
+      ({
+        isHeadless,
+        dataId,
+      }: {
+        isHeadless: boolean | undefined;
+        dataId: string | undefined;
+      }): void => {
+        assert.equal(isHeadless, true);
+        assert.equal(dataId, undefined);
+      },
+    );
+    enriched(
+      `data ${i}`,
+      ({
+        isHeadless,
+        dataId,
+        testData,
+        path,
+        attachConsole,
+      }: {
+        isHeadless: boolean | undefined;
+        dataId: string | undefined;
+        testData: TestData;
+        path: string;
+        attachConsole: boolean | undefined;
+      }): void => {
+        assert.equal(isHeadless, false);
+        assert.equal(dataId, "Default");
+        assert.equal(path, testData.codemarkPath);
+        assert.equal(attachConsole, true);
+      },
+    );
+  }
+
+  assert.deepEqual(started, []);
+  assert.equal(loads, 0);
+  const results: readonly TestResult[] = await suite.run();
+  assert.deepEqual(
+    results.filter(
+      (result): result is TestResult & { status: "failed" } => result.status === "failed",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    results.map((result: TestResult): string => result.title),
+    titles,
+  );
+  assert.deepEqual(started, titles);
+  assert.equal(loads, rounds);
+  assert.deepEqual(await suite.run(), []);
+});
+
+await test("missing data skips setup and a partial provider failure unwinds every acquisition", async (): Promise<void> => {
+  const events: string[] = [];
+  const suite: TestSuite<MockResources> = createTestRunner({
+    createResources: ({ scope }: TestInfo): Promise<MockResources> =>
+      createMockResources(scope, events),
+    loadTestData: (id: string): Promise<TestData | undefined> => {
+      events.push(`data: ${id}`);
+      return Promise.resolve(TEST_DATA.get(id));
+    },
+  });
+  const setupError = new Error("provider failed");
+  const closePageError = new Error("extra page cleanup failed");
+  const closeTokenError = new Error("token cleanup failed");
+  const extraPage: TestRunner<
+    MockResources & {
+      otherPage: MockPage;
+    }
+  > = suite.extend(
+    async (
+      { browser }: Readonly<MockResources>,
+      { scope }: TestInfo,
+    ): Promise<{
+      otherPage: MockPage;
+    }> => ({
+      otherPage: await scope.acquire(
+        (): Promise<MockPage> => browser.newPage(),
+        async (page: MockPage): Promise<never> => {
+          await page.close();
+          throw closePageError;
+        },
+      ),
+    }),
+  );
+  const broken: TestRunner<
+    MockResources & {
+      otherPage: MockPage;
+    } & Promise<never>
+  > = extraPage.extend(
+    async (
+      _context: Readonly<
+        MockResources & {
+          otherPage: MockPage;
+        }
+      >,
+      { scope }: TestInfo,
+    ): Promise<never> => {
+      await scope.acquire(
+        (): string => "token",
+        (): never => {
+          events.push("token: close");
+          throw closeTokenError;
+        },
+      );
+      throw setupError;
+    },
+  );
+  extraPage.withData("missing")("bad id", (): never => assert.fail("body ran"));
+  broken("bad provider", (): never => assert.fail("body ran"));
+  suite("smoke", async ({ apiClient }: MockResources): Promise<void> => {
+    assert.equal(await apiClient.ping(), "pong");
+    events.push("smoke");
+  });
+
+  const [missing, failed, passed] = await suite.run();
+  assert.ok(missing?.status === "failed" && missing.error instanceof Error);
+  // biome-ignore lint/performance/useTopLevelRegex: OK
+  assert.match(missing.error.message, /Unknown test data ID "missing" in test "bad id"/);
+  assert.ok(failed?.status === "failed" && failed.error instanceof AggregateError);
+  assert.deepEqual(failed.error.errors, [setupError, closeTokenError, closePageError]);
+  assert.equal(passed?.status, "passed");
+  const open: string[] = ["server: start", "browser: launch", "page: create", "apiClient: create"];
+  const close: string[] = ["apiClient: close", "page: close", "browser: close", "server: close"];
+  assert.deepEqual(events, [
+    "data: missing",
+    ...open,
+    "page: create",
+    "token: close",
+    "page: close",
+    ...close,
+    ...open,
+    "smoke",
+    ...close,
+  ]);
+});
+
+await test("extensions reject existing string, symbol and testData keys", async (): Promise<void> => {
+  const label: unique symbol = Symbol("label");
+  const suite: TestSuite<{
+    port: number;
+  }> = createTestRunner({
+    createResources: (): { port: number } => ({ port: 80 }),
+    // oxlint-disable-next-line legibility/no-trivial-wrapper-functions
+    loadTestData: (id: string): TestData | undefined => TEST_DATA.get(id),
+  });
+  // oxlint-disable-next-line unicorn/consistent-function-scoping
+  const neverRun: () => never = (): never => assert.fail("body ran after a collision");
+  // @ts-expect-error Even a replacement of the same type is a collision.
+  suite.extend((): { port: number } => ({ port: 81 }))("base key", neverRun);
+  const tagged: TestRunner<
+    {
+      port: number;
+    } & object
+  > = suite.extend((): Record<symbol, boolean> => ({ [label]: true }));
+  const hiddenSymbol: object = { [label]: false };
+  tagged.extend((): object => hiddenSymbol)("extension key", neverRun);
+  const hiddenData: object = { testData: 0 };
+  suite.extend((): object => hiddenData).withData("Default")("data key", neverRun);
+  const withData: TestRunner<
+    WithTestData<{
+      port: number;
+    }>
+  > = suite.withData("Default").configure({});
+
+  assert.throws(
+    // @ts-expect-error A runner with testData cannot select another data ID.
+    (): TestRunner<WithTestData<WithTestData<{ port: number }>>> => withData.withData("again"),
+    // biome-ignore lint/performance/useTopLevelRegex: OK
+    /already selected/,
+  );
+
+  const results: readonly TestResult[] = await suite.run();
+  assert.deepEqual(
+    results.map((result: TestResult): string => {
+      assert.ok(result.status === "failed" && result.error instanceof Error);
+      return result.error.message;
+    }),
+    [
+      'Test context already contains the key "port".',
+      'Test context already contains the key "Symbol(label)".',
+      'Test context already contains the key "testData".',
+    ],
+  );
+});
+
+await test("overlapping runs reject and late registrations wait for the next run", async (): Promise<void> => {
+  const suite = createTestRunner({
+    createResources: (): object => ({}),
+    loadTestData: (): undefined => undefined,
+  });
+  const child: TestRunner<object> = suite.configure({});
+  const entered: {
+    promise: Promise<void>;
+    resolve: (value?: void | PromiseLike<void>) => void;
+    reject: (reason?: unknown) => void;
+  } = Promise.withResolvers<void>();
+  const release: {
+    promise: Promise<void>;
+    resolve: (value?: void | PromiseLike<void>) => void;
+    reject: (reason?: unknown) => void;
+  } = Promise.withResolvers<void>();
+  child("first", async (): Promise<void> => {
+    child("late from body", (): void => {
+      /* noop */
+    });
+    entered.resolve();
+    await release.promise;
+  });
+  const running: Promise<readonly TestResult[]> = suite.run();
+  await entered.promise;
+  try {
+    suite("late from caller", (): never => {
+      // oxlint-disable-next-line typescript/only-throw-error
+      throw undefined;
+    });
+    // biome-ignore lint/performance/useTopLevelRegex: The regex is used for assertion, not performance-critical.
+    await assert.rejects(suite.run(), /already running/);
+  } finally {
+    release.resolve();
+  }
+
+  const first: readonly TestResult[] = await running;
+  assert.deepEqual(
+    first.map((result: TestResult): string[] => [result.title, result.status]),
+    [["first", "passed"]],
+  );
+  const next: readonly TestResult[] = await suite.run();
+  assert.deepEqual(
+    next.map((result: TestResult): string[] => [result.title, result.status]),
+    [
+      ["late from body", "passed"],
+      ["late from caller", "failed"],
+    ],
+  );
+  const failure: TestResult | undefined = next[1];
+  assert.ok(failure?.status === "failed" && Object.hasOwn(failure, "error"));
+  assert.equal(failure.error, undefined);
+  assert.deepEqual(await suite.run(), []);
+});
