@@ -11,10 +11,33 @@ import type {
   TestInfo,
   TestResult,
   TestRunner,
+  TestRunnerConfig,
   TestSuite,
   WithTestData,
 } from "./test-runner.mjs";
-import { createTestRunner } from "./test-runner.mjs";
+import { createTestRunner, createTestRunnerWithDefaults } from "./test-runner.mjs";
+
+await test("the two factories validate upfront data IDs", (): void => {
+  const config: TestRunnerConfig<object> = {
+    createResources: (): object => ({}),
+    loadTestData: (): undefined => undefined,
+  };
+  const defaults = { ...config, dataId: "" };
+  assert.throws(
+    (): void => {
+      // @ts-expect-error A defined ID belongs to the defaults factory, even on a variable.
+      createTestRunner(defaults);
+    },
+    { message: "Use `createTestRunnerWithDefaults()` to set a suite data ID.", name: "TypeError" },
+  );
+  assert.throws(
+    (): void => {
+      // @ts-expect-error The defaults factory requires an ID.
+      createTestRunnerWithDefaults(config);
+    },
+    { message: "`createTestRunnerWithDefaults()` requires a string dataId.", name: "TypeError" },
+  );
+});
 
 await test("interleaved handles share registration order and keep their options and types", async (t: TestContext): Promise<void> => {
   t.mock.method(console, "log", (): void => {
@@ -159,7 +182,7 @@ await test("a root data ID is inherited and an override reaches earlier provider
     },
     options,
   };
-  const suite: FallbackTestSuite<Context> = createTestRunner.withDefaultData<Resources>(config);
+  const suite: FallbackTestSuite<Context> = createTestRunnerWithDefaults<Resources>(config);
   options.isHeadless = false;
   const derived: FallbackTestRunner<Extended> = suite.extend(
     ({ testData, factoryInfo }: Readonly<Context>, info: TestInfo): { providerPath: string } => {
@@ -168,10 +191,16 @@ await test("a root data ID is inherited and an override reaches earlier provider
       return { providerPath: testData.codemarkPath };
     },
   );
-  const custom: TestRunner<Extended> = derived
+  const custom: TestRunner<
+    Resources & {
+      readonly testData: TestData;
+    } & {
+      readonly providerPath: string;
+    }
+  > = derived
     .configure({ isHeadless: false })
     .withData("Other")
-    .configure({ willAttachConsole: false });
+    .configure({ willAttachConsole: false }) satisfies TestRunner<Extended>;
   function checkBody({ factoryInfo, testData, providerPath }: Extended): void {
     assert.equal(factoryInfo.dataId, testData.codemarkPath);
     assert.equal(providerPath, testData.codemarkPath);
@@ -183,8 +212,10 @@ await test("a root data ID is inherited and an override reaches earlier provider
   derived("sibling", checkBody);
   custom("custom again", checkBody);
   assert.throws(
-    // @ts-expect-error An explicit replacement has already selected the ID on this branch.
-    (): TestRunner<WithTestData<Extended>> => custom.withData("third"),
+    (): void => {
+      // @ts-expect-error An explicit replacement has already selected the ID on this branch.
+      custom.withData("third");
+    },
     // biome-ignore lint/performance/useTopLevelRegex: OK
     /already selected/,
   );
@@ -207,7 +238,7 @@ await test("a root data ID is inherited and an override reaches earlier provider
 await test("only the effective ID is validated before resource setup", async (): Promise<void> => {
   const loads: string[] = [];
   const starts: string[] = [];
-  const suite: FallbackTestSuite<WithTestData<object>> = createTestRunner.withDefaultData({
+  const suite: FallbackTestSuite<WithTestData> = createTestRunnerWithDefaults({
     createResources: ({ title }: TestInfo): object => {
       starts.push(title);
       return {};
@@ -224,7 +255,7 @@ await test("only the effective ID is validated before resource setup", async ():
   const unexpectedBody: () => never = (): never => assert.fail("body ran with unknown data");
   suite("bad default", unexpectedBody);
   suite.withData("missing override")("bad override", unexpectedBody);
-  suite.withData("")("valid override", ({ testData }: WithTestData<object>): void => {
+  suite.withData("")("valid override", ({ testData }: WithTestData): void => {
     assert.equal(testData.codemarkPath, "empty-id.json");
   });
 
@@ -266,13 +297,13 @@ await test("initial options alone keep a plain context and fallback data remains
   // oxlint-disable-next-line unicorn/consistent-function-scoping
   const loadTestData: () => TestData = (): TestData => ({ codemarkPath: "fixture", snapshots: [] });
 
-  createTestRunner.withDefaultData({
+  createTestRunnerWithDefaults({
     createResources: (): typeof resource => resource,
     // @ts-expect-error Fallback data cannot replace a statically known resource key.
     dataId: "Default",
     loadTestData,
   });
-  const hidden: FallbackTestSuite<WithTestData<object>> = createTestRunner.withDefaultData({
+  const hidden: FallbackTestSuite<WithTestData> = createTestRunnerWithDefaults({
     createResources: (): Record<string, unknown> => resource,
     // @ts-expect-error Fallback data cannot replace a statically known resource key.
     dataId: "Default",
@@ -399,8 +430,10 @@ await test("extensions reject existing string, symbol and testData keys", async 
   > = suite.withData("Default").configure({});
 
   assert.throws(
-    // @ts-expect-error A runner with testData cannot select another data ID.
-    (): TestRunner<WithTestData<WithTestData<{ port: number }>>> => withData.withData("again"),
+    (): void => {
+      // @ts-expect-error A runner with testData cannot select another data ID.
+      withData.withData("again");
+    },
     // biome-ignore lint/performance/useTopLevelRegex: OK
     /already selected/,
   );
@@ -420,7 +453,7 @@ await test("extensions reject existing string, symbol and testData keys", async 
 });
 
 await test("overlapping runs reject and late registrations wait for the next run", async (): Promise<void> => {
-  const suite = createTestRunner({
+  const suite: TestSuite<object> = createTestRunner({
     createResources: (): object => ({}),
     loadTestData: (): undefined => undefined,
   });

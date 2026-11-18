@@ -88,7 +88,7 @@ export interface TestInfo extends RunnerOptions {
 
 type Awaitable<T> = T | Promise<T>;
 export type TestBody<Context> = (context: Context) => Awaitable<void>;
-export type WithTestData<Context> = Context & { readonly testData: TestData };
+export type WithTestData<Context = unknown> = Context & { readonly testData: TestData };
 
 // A provider may only return new fields, even when an existing field has the same type.
 type Provider<Context, Extra extends object> = (
@@ -98,35 +98,26 @@ type Provider<Context, Extra extends object> = (
 
 type AvailableDataId<Context> = "testData" extends keyof Context ? never : string;
 
-export interface TestRunner<Context extends object> {
-  readonly configure: (options: RunnerOptions) => TestRunner<Context>;
+/** Only a fallback handle accepts replacement IDs when the context already contains testData. */
+export interface TestRunner<Context extends object, OverrideId extends string = never> {
+  readonly configure: (options: RunnerOptions) => TestRunner<Context, OverrideId>;
   readonly extend: <Extra extends object>(
     provide: Provider<Context, Extra>,
-  ) => TestRunner<Context & Extra>;
-  readonly withData: (id: AvailableDataId<Context>) => TestRunner<WithTestData<Context>>;
+  ) => TestRunner<Context & Extra, OverrideId>;
+  readonly withData: (
+    id: AvailableDataId<Context> | OverrideId,
+  ) => TestRunner<Context & WithTestData>;
   (title: string, body: TestBody<Context>): void;
 }
 
-/** This handle already supplies testData and still accepts one explicit ID. */
-export interface FallbackTestRunner<
-  Context extends WithTestData<object>,
-> extends TestRunner<Context> {
-  readonly configure: (options: RunnerOptions) => FallbackTestRunner<Context>;
-  readonly extend: <Extra extends object>(
-    provide: Provider<Context, Extra>,
-  ) => FallbackTestRunner<Context & Extra>;
-  readonly withData: (id: string) => TestRunner<Context>;
-}
-
-export interface TestSuite<Context extends object> extends TestRunner<Context> {
+interface Runnable {
   readonly run: () => Promise<readonly TestResult[]>;
 }
 
-export interface FallbackTestSuite<
-  Context extends WithTestData<object>,
-> extends FallbackTestRunner<Context> {
-  readonly run: () => Promise<readonly TestResult[]>;
-}
+export type FallbackTestRunner<Context extends WithTestData> = TestRunner<Context, string>;
+export type TestSuite<Context extends object> = TestRunner<Context> & Runnable;
+export type FallbackTestSuite<Context extends WithTestData> = FallbackTestRunner<Context> &
+  Runnable;
 
 type ResolveContext<Context> = (info: TestInfo) => Awaitable<Context>;
 
@@ -169,17 +160,16 @@ function extendContext<Context extends object, Extra extends object>(
 ): ResolveContext<Context & Extra> {
   return async (info: TestInfo): Promise<Context & Extra> => {
     const context: Awaited<Context> = await resolve(info);
-    return addFields<Context, Extra>(context, await provide(context, info));
+    return addFields(context, await provide(context, info));
   };
 }
 
 /** Each public factory creates one queue. All handles derived from it share that queue. */
-// : { plain: () => TestSuite<Resources>, withDefaultData: (id: string) => FallbackTestSuite<WithTestData<Resources>>  }
 function createSuite<Resources extends object>(
   config: SuiteConfig<Resources>,
 ): {
   plain: () => TestSuite<Resources>;
-  withDefaultData: (id: string) => FallbackTestSuite<WithTestData<Resources>>;
+  withDefaults: (id: string) => FallbackTestSuite<WithTestData<Resources>>;
 } {
   const registry: RegisteredTest[] = [];
   let isRunning: boolean = false;
@@ -243,7 +233,7 @@ function createSuite<Resources extends object>(
     });
   }
 
-  function buildFallback<Context extends WithTestData<object>>(
+  function buildFallback<Context extends WithTestData>(
     resolve: ResolveContext<Context>,
     options: RunnerOptions,
     defaultId: string,
@@ -311,18 +301,21 @@ function createSuite<Resources extends object>(
     }
   }
 
-  const createSuiteOptions: RunnerOptions = { ...config.options };
+  const initialOptions: RunnerOptions = { ...config.options };
   // oxlint-disable-next-line legibility/no-trivial-wrapper-functions
-  const createSuiteResolve: ResolveContext<Resources> = (info: TestInfo): Awaitable<Resources> =>
+  const resolveResources: ResolveContext<Resources> = (info: TestInfo): Awaitable<Resources> =>
     config.createResources(info);
   return {
-    plain: (): TestSuite<Resources> =>
-      Object.assign(build(createSuiteResolve, createSuiteOptions), { run }),
-    withDefaultData: (id: string): FallbackTestSuite<WithTestData<Resources>> =>
-      Object.assign(
-        buildFallback(resolveWithData(createSuiteResolve, id), createSuiteOptions, id),
-        { run },
-      ),
+    plain: (): TestRunner<Resources> & { run: () => Promise<readonly TestResult[]> } =>
+      Object.assign(build(resolveResources, initialOptions), { run }),
+    withDefaults: (
+      id: string,
+    ): FallbackTestRunner<WithTestData<Resources>> & {
+      run: () => Promise<readonly TestResult[]>;
+    } =>
+      Object.assign(buildFallback(resolveWithData(resolveResources, id), initialOptions, id), {
+        run,
+      }),
   };
 }
 
@@ -331,17 +324,17 @@ export function createTestRunner<Resources extends object>(
 ): TestSuite<Resources> {
   const dataId: unknown = config.dataId;
   if (dataId !== undefined) {
-    throw new TypeError("Use createTestRunner.withDefaultData() to set a suite data ID.");
+    throw new TypeError("Use `createTestRunnerWithDefaults()` to set a suite data ID.");
   }
   return createSuite(config).plain();
 }
 
-createTestRunner.withDefaultData = function withDefaultData<Resources extends object>(
+export function createTestRunnerWithDefaults<Resources extends object>(
   config: DefaultDataConfig<Resources>,
 ): FallbackTestSuite<WithTestData<Resources>> {
-  const id: string = config.dataId;
-  if (typeof id !== "string") {
-    throw new TypeError("createTestRunner.withDefaultData() requires a string dataId.");
+  const dataId: unknown = config.dataId;
+  if (typeof dataId !== "string") {
+    throw new TypeError("`createTestRunnerWithDefaults()` requires a string dataId.");
   }
-  return createSuite(config).withDefaultData(id);
-};
+  return createSuite(config).withDefaults(dataId);
+}

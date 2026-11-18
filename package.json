@@ -5,11 +5,33 @@
   "type": "module",
   "scripts": {
     "build": "tsc --project tsconfig.json",
-    "example": "npm run build && node dist/example.mjs",
-    "test": "npm run build && node --test dist/test-runner.test.mjs"
+    "example": "bun run build && bun run dist/example.mjs",
+    "fmt": "oxfmt --write",
+    "fmt:check": "oxfmt --check",
+    "lint": "bun run lint:biome && bun run lint:oxlint",
+    "lint:biome": "biome check --reporter=concise --max-diagnostics 999",
+    "lint:biome:fix": "biome check --write",
+    "lint:biome:full": "biome check --max-diagnostics 999 --verbose",
+    "lint:biome:summary": "biome check --max-diagnostics 999 --reporter=summary",
+    "lint:fix": "bun run lint:biome:fix && bun run lint:oxlint:fix",
+    "lint:oxlint": "oxlint --deny-warnings --format=agent",
+    "lint:oxlint:fix": "oxlint --fix",
+    "lint:oxlint:full": "oxlint --deny-warnings",
+    "lint:oxlint:sarif": "oxlint --deny-warnings --format=sarif",
+    "test": "bun run build && bun test dist/test-runner.test.mjs"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.6.8",
     "@types/node": "^26.6.6",
+    "eslint-plugin-legibility": "^0.4.0",
+    "eslint-plugin-playwright": "^2.12.2",
+    "eslint-plugin-regexp": "^3.3.3",
+    "oxfmt": "^0.79.0",
+    "oxlint": "^1.94.0",
+    "oxlint-tsgolint": "^7.0.2007",
     "typescript": "^7.1.0-dev.20261116.1"
+  },
+  "engines": {
+    "bun": ">=1.4.5"
   }
 }
