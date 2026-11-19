@@ -20,9 +20,8 @@ export class ResourceScope {
    * causing its cleanup to be registered too late to execute.
    *
    * The test runner guarantees this ordering by awaiting resource
-   * initialization before disposing of the scope. Both resource factories
-   * and extension providers must settle their acquisitions before they
-   * return or throw.
+   * initialization before disposing of the scope. Extension providers
+   * must settle their acquisitions before they return or throw.
    *
    * If initialization fails after partially acquiring a resource,
    * the initializer is responsible for cleaning up that partial state.
@@ -71,69 +70,64 @@ export class ResourceScope {
 }
 
 export type TestResult =
-  | Readonly<{ title: string; status: "passed"; durationMS: number }>
-  | Readonly<{ title: string; status: "failed"; durationMS: number; error: unknown }>;
+  | Readonly<{ durationMS: number; status: "passed"; title: string }>
+  | Readonly<{ durationMS: number; error: unknown; status: "failed"; title: string }>;
 
 export interface RunnerOptions {
+  readonly dataId?: string;
   readonly isHeadless?: boolean;
   readonly willAttachConsole?: boolean;
 }
 
 /** Final options and the resource scope for this particular test execution. */
 export interface TestInfo extends RunnerOptions {
-  readonly dataId: string | undefined;
   readonly scope: ResourceScope;
   readonly title: string;
 }
 
 type Awaitable<T> = T | Promise<T>;
-export type TestBody<Context> = (context: Context) => Awaitable<void>;
-export type WithTestData<Context = unknown> = Context & { readonly testData: TestData };
 
-// A provider may only return new fields, even when an existing field has the same type.
-type Provider<Context, Extra extends object> = (
+export type TestBody<Context> = (context: Context, info: TestInfo) => Awaitable<void>;
+
+type Disjoint<Context, Extra> = Extra & { [Key in keyof Context]?: never };
+
+type Merge<Context extends object, Extra extends object> = [Awaited<Extra>] extends [never]
+  ? Context
+  : [keyof Context] extends [never]
+    ? Extra
+    : [keyof Extra] extends [never]
+      ? Context
+      : Context & Extra;
+
+/** A provider may only return new fields, even when an existing field has the same type. */
+export type Provider<Context extends object, Extra extends object> = (
   context: Readonly<Context>,
   info: TestInfo,
-) => Awaitable<Extra & { [Key in keyof Context]?: never }>;
+) => Disjoint<Context, Extra> | Promise<Disjoint<Context, Extra>>;
 
-type AvailableDataId<Context> = "testData" extends keyof Context ? never : string;
+export type WithTestData<Context extends object = object> = Merge<
+  Context,
+  { readonly testData: TestData }
+>;
 
-/** Only a fallback handle accepts replacement IDs when the context already contains testData. */
-export interface TestRunner<Context extends object, OverrideId extends string = never> {
-  readonly configure: (options: RunnerOptions) => TestRunner<Context, OverrideId>;
+export type TestDataLoader =
+  | ReadonlyMap<string, TestData>
+  | ((dataId: string, info: TestInfo) => Awaitable<TestData | undefined>);
+
+export interface TestRunner<Context extends object = object> {
+  readonly configure: (options: RunnerOptions) => TestRunner<Context>;
   readonly extend: <Extra extends object>(
     provide: Provider<Context, Extra>,
-  ) => TestRunner<Context & Extra, OverrideId>;
-  readonly withData: (
-    id: AvailableDataId<Context> | OverrideId,
-  ) => TestRunner<Context & WithTestData>;
+  ) => TestRunner<Merge<Context, Extra>>;
   (title: string, body: TestBody<Context>): void;
 }
 
-interface Runnable {
+export interface TestSuite {
   readonly run: () => Promise<readonly TestResult[]>;
+  readonly test: TestRunner;
 }
 
-export type FallbackTestRunner<Context extends WithTestData> = TestRunner<Context, string>;
-export type TestSuite<Context extends object> = TestRunner<Context> & Runnable;
-export type FallbackTestSuite<Context extends WithTestData> = FallbackTestRunner<Context> &
-  Runnable;
-
-type ResolveContext<Context> = (info: TestInfo) => Awaitable<Context>;
-
-interface SuiteConfig<Resources extends object> {
-  readonly createResources: ResolveContext<Resources>;
-  readonly loadTestData: (dataId: string, info: TestInfo) => Awaitable<TestData | undefined>;
-  readonly options?: RunnerOptions;
-}
-
-export interface TestRunnerConfig<Resources extends object> extends SuiteConfig<Resources> {
-  readonly dataId?: undefined;
-}
-
-export interface DefaultDataConfig<Resources extends object> extends SuiteConfig<Resources> {
-  readonly dataId: AvailableDataId<Resources>;
-}
+type ResolveContext<Context extends object> = (info: TestInfo) => Promise<Context>;
 
 interface RegisteredTest {
   readonly execute: (scope: ResourceScope) => Promise<void>;
@@ -144,109 +138,81 @@ interface RegisteredTest {
 function addFields<Context extends object, Extra extends object>(
   context: Context,
   extra: Extra,
-): Context & Extra {
-  // Types can hide fields, e.g. when a provider reads a dynamic key.
+): Merge<Context, Extra> {
+  // Types can hide fields, e.g. when a provider returns a dynamically keyed object.
   for (const key of Reflect.ownKeys(extra)) {
     if (Object.hasOwn(context, key)) {
       throw new Error(`Test context already contains the key "${String(key)}".`);
     }
   }
-  return { ...context, ...extra };
+  return Object.freeze({ ...context, ...extra });
 }
 
 function extendContext<Context extends object, Extra extends object>(
   resolve: ResolveContext<Context>,
   provide: Provider<Context, Extra>,
-): ResolveContext<Context & Extra> {
-  return async (info: TestInfo): Promise<Context & Extra> => {
-    const context: Awaited<Context> = await resolve(info);
-    return addFields(context, await provide(context, info));
+): ResolveContext<Merge<Context, Extra>> {
+  return async (info: TestInfo): Promise<Merge<Context, Extra>> => {
+    const context: Context = await resolve(info);
+    const extra: Extra = await provide(context, info);
+    return addFields(context, extra);
   };
 }
 
-/** Each public factory creates one queue. All handles derived from it share that queue. */
-function createSuite<Resources extends object>(
-  config: SuiteConfig<Resources>,
-): {
-  plain: () => TestSuite<Resources>;
-  withDefaults: (id: string) => FallbackTestSuite<WithTestData<Resources>>;
-} {
+/** Provide `testData` by resolving the effective `info.dataId` against a map or loader. */
+export function provideTestData(
+  source: TestDataLoader,
+): (_context: Readonly<object>, info: TestInfo) => Promise<{ readonly testData: TestData }> {
+  return async (
+    _context: Readonly<object>,
+    info: TestInfo,
+  ): Promise<{ readonly testData: TestData }> => {
+    const { dataId, title } = info;
+    if (dataId === undefined) {
+      throw new Error(`No test data ID configured in test "${title}".`);
+    }
+    const testData: TestData | undefined =
+      typeof source === "function" ? await source(dataId, info) : source.get(dataId);
+    if (testData === undefined) {
+      throw new Error(`Unknown test data ID "${dataId}" in test "${title}".`);
+    }
+    return { testData };
+  };
+}
+
+/** Create an isolated test suite queue and its root composable `test` handle. */
+export function createTestSuite(options?: RunnerOptions): TestSuite {
   const registry: RegisteredTest[] = [];
   let isRunning: boolean = false;
 
   function register<Context extends object>(
     resolveContext: ResolveContext<Context>,
-    options: RunnerOptions,
-    dataId: string | undefined,
+    currentOptions: RunnerOptions,
   ): (title: string, body: TestBody<Context>) => void {
-    console.debug(`Building test runner with data ID: ${dataId} and options:`, options);
     return (title: string, body: TestBody<Context>): void => {
       // Capture the resolver and its matching body while Context is still known.
       registry.push({
         execute: async (scope: ResourceScope): Promise<void> => {
-          const info: TestInfo = Object.freeze({ ...options, dataId, scope, title });
-          console.debug(
-            `Running test: "${title}" with data ID: "${dataId ?? "none"}" and options:`,
-            options,
-          );
-          const resolvedContext: Awaited<Context> = await resolveContext(info);
-
-          await body(resolvedContext);
+          const info: TestInfo = Object.freeze({ ...currentOptions, scope, title });
+          const resolvedContext: Context = await resolveContext(info);
+          await body(resolvedContext, info);
         },
         title,
       });
     };
   }
 
-  function resolveWithData<Context extends object>(
-    parent: ResolveContext<Context>,
-    initialId: string,
-  ): ResolveContext<WithTestData<Context>> {
-    return async (info: TestInfo): Promise<WithTestData<Context>> => {
-      // This stage runs once per test, using the final handle's ID before any resource setup.
-      const id: string = info.dataId ?? initialId;
-      const testData: TestData | undefined = await config.loadTestData(id, info);
-      if (testData === undefined) {
-        throw new Error(`Unknown test data ID "${id}" in test "${info.title}".`);
-      }
-      return addFields(await parent(info), { testData });
-    };
-  }
-
   function build<Context extends object>(
     resolve: ResolveContext<Context>,
-    options: RunnerOptions,
-    selectedId?: string,
+    currentOptions: RunnerOptions,
   ): TestRunner<Context> {
-    return Object.assign(register(resolve, options, selectedId), {
+    return Object.assign(register(resolve, currentOptions), {
       configure: (overrides: RunnerOptions): TestRunner<Context> =>
-        build(resolve, { ...options, ...overrides }, selectedId),
+        build(resolve, { ...currentOptions, ...overrides }),
       extend: <Extra extends object>(
         provide: Provider<Context, Extra>,
-      ): TestRunner<Context & Extra> => build(extendContext(resolve, provide), options, selectedId),
-      withData(id: string): TestRunner<WithTestData<Context>> {
-        if (selectedId !== undefined) {
-          throw new Error(`Test data "${selectedId}" is already selected on this runner.`);
-        }
-        return build(resolveWithData(resolve, id), options, id);
-      },
-    });
-  }
-
-  function buildFallback<Context extends WithTestData>(
-    resolve: ResolveContext<Context>,
-    options: RunnerOptions,
-    defaultId: string,
-  ): FallbackTestRunner<Context> {
-    return Object.assign(register(resolve, options, defaultId), {
-      configure: (overrides: RunnerOptions): FallbackTestRunner<Context> =>
-        buildFallback(resolve, { ...options, ...overrides }, defaultId),
-      extend: <Extra extends object>(
-        provide: Provider<Context, Extra>,
-      ): FallbackTestRunner<Context & Extra> =>
-        buildFallback(extendContext(resolve, provide), options, defaultId),
-      // The resolver already installs the fixture. The child only selects its final ID.
-      withData: (id: string): TestRunner<Context> => build(resolve, options, id),
+      ): TestRunner<Merge<Context, Extra>> =>
+        build(extendContext(resolve, provide), currentOptions),
     });
   }
 
@@ -257,15 +223,13 @@ function createSuite<Resources extends object>(
 
     try {
       await item.execute(scope);
-    } catch (err: unknown) {
+    } catch (caught: unknown) {
       // An error can be literally `undefined`, so use the array length.
-      errors.push(err);
+      errors.push(caught);
     } finally {
       // Includes resources successfully acquired before partial setup failure.
-      // biome-ignore lint/nursery/noUnreadableForOfExpression: OK
-      for (const err of await scope.dispose()) {
-        errors.push(err);
-      }
+      const cleanupErrors: unknown[] = await scope.dispose();
+      errors.push(...cleanupErrors);
     }
 
     const durationMS: number = performance.now() - startedAt;
@@ -301,40 +265,10 @@ function createSuite<Resources extends object>(
     }
   }
 
-  const initialOptions: RunnerOptions = { ...config.options };
-  // oxlint-disable-next-line legibility/no-trivial-wrapper-functions
-  const resolveResources: ResolveContext<Resources> = (info: TestInfo): Awaitable<Resources> =>
-    config.createResources(info);
+  const emptyContext: object = Object.freeze({});
+  const initialOptions: RunnerOptions = { ...options };
   return {
-    plain: (): TestRunner<Resources> & { run: () => Promise<readonly TestResult[]> } =>
-      Object.assign(build(resolveResources, initialOptions), { run }),
-    withDefaults: (
-      id: string,
-    ): FallbackTestRunner<WithTestData<Resources>> & {
-      run: () => Promise<readonly TestResult[]>;
-    } =>
-      Object.assign(buildFallback(resolveWithData(resolveResources, id), initialOptions, id), {
-        run,
-      }),
+    run,
+    test: build((): Promise<object> => Promise.resolve(emptyContext), initialOptions),
   };
-}
-
-export function createTestRunner<Resources extends object>(
-  config: TestRunnerConfig<Resources>,
-): TestSuite<Resources> {
-  const dataId: unknown = config.dataId;
-  if (dataId !== undefined) {
-    throw new TypeError("Use `createTestRunnerWithDefaults()` to set a suite data ID.");
-  }
-  return createSuite(config).plain();
-}
-
-export function createTestRunnerWithDefaults<Resources extends object>(
-  config: DefaultDataConfig<Resources>,
-): FallbackTestSuite<WithTestData<Resources>> {
-  const dataId: unknown = config.dataId;
-  if (typeof dataId !== "string") {
-    throw new TypeError("`createTestRunnerWithDefaults()` requires a string dataId.");
-  }
-  return createSuite(config).withDefaults(dataId);
 }

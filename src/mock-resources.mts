@@ -1,4 +1,5 @@
-import type { ResourceScope } from "./test-runner.mjs";
+import type { TestData } from "./test-data.mjs";
+import type { ResourceScope, TestInfo, WithTestData } from "./test-runner.mjs";
 
 export class MockPage {
   public constructor(private readonly events: string[]) {}
@@ -30,8 +31,8 @@ export class MockServer {
 export class MockBrowser {
   public constructor(private readonly events: string[]) {}
   // oxlint-disable-next-line typescript/require-await
-  public static async launch(events: string[]): Promise<MockBrowser> {
-    events.push("browser: launch");
+  public static async launch(events: string[], testData: TestData): Promise<MockBrowser> {
+    events.push(`browser: launch with ${testData.codemarkPath}`);
     return new MockBrowser(events);
   }
   // oxlint-disable-next-line typescript/require-await
@@ -68,15 +69,17 @@ export interface MockResources {
 
 /** Initialize all four resources, with cleanup registered per acquisition. */
 export async function createMockResources(
-  scope: ResourceScope,
   events: string[],
+  context: Readonly<WithTestData>,
+  testInfo: Readonly<TestInfo>,
 ): Promise<MockResources> {
+  const scope: ResourceScope = testInfo.scope;
   const server: MockServer = await scope.acquire(
     (): Promise<MockServer> => MockServer.start(events),
     (value: MockServer): Promise<void> => value.close(),
   );
   const browser: MockBrowser = await scope.acquire(
-    (): Promise<MockBrowser> => MockBrowser.launch(events),
+    (): Promise<MockBrowser> => MockBrowser.launch(events, context.testData),
     (value: MockBrowser): Promise<void> => value.close(),
   );
   const page: MockPage = await scope.acquire(

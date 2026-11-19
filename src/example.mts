@@ -1,36 +1,32 @@
 import { createMockResources } from "./mock-resources.mjs";
-import type { MockResources, MockPage } from "./mock-resources.mjs";
+import type { MockPage, MockResources } from "./mock-resources.mjs";
 import { TEST_DATA } from "./test-data.mjs";
-import type { TestData } from "./test-data.mjs";
-import { createTestRunnerWithDefaults } from "./test-runner.mjs";
-import type {
-  FallbackTestSuite,
-  TestInfo,
-  TestResult,
-  TestRunner,
-  WithTestData,
-} from "./test-runner.mjs";
+import { createTestSuite, provideTestData } from "./test-runner.mjs";
+import type { TestInfo, TestResult, TestRunner, TestSuite, WithTestData } from "./test-runner.mjs";
 
 const events: string[] = [];
-console.log("\nCreating a test suite with defaults");
-const test: FallbackTestSuite<WithTestData<MockResources>> =
-  createTestRunnerWithDefaults<MockResources>({
-    createResources: ({ scope, isHeadless }: TestInfo): Promise<MockResources> => {
-      events.push(`headless option: ${isHeadless ?? "default"}`);
-      return createMockResources(scope, events);
+console.log("\nCreating a test suite with default options");
+const suite: TestSuite = createTestSuite({
+  dataId: "Default",
+  willAttachConsole: false,
+});
+
+const test: TestRunner<WithTestData<MockResources>> = suite.test
+  .extend(provideTestData(TEST_DATA))
+  .extend(
+    (context: Readonly<WithTestData>, testInfo: Readonly<TestInfo>): Promise<MockResources> => {
+      events.push(`headless option: ${testInfo.isHeadless ?? "default"}`);
+      return createMockResources(events, context, testInfo);
     },
-    dataId: "Default",
-    // oxlint-disable-next-line legibility/no-trivial-wrapper-functions
-    loadTestData: (id: string): TestData | undefined => TEST_DATA.get(id),
-    options: { willAttachConsole: false },
-  });
+  );
 
 console.log("\nCreating headlessTest");
-const headlessTest: TestRunner<WithTestData<MockResources>, string> = test.configure({
+const headlessTest: TestRunner<WithTestData<MockResources>> = test.configure({
   isHeadless: true,
 });
+
 console.log("\nCreating headedTest");
-const headedTest: TestRunner<WithTestData<MockResources>, string> = test.configure({
+const headedTest: TestRunner<WithTestData<MockResources>> = test.configure({
   isHeadless: false,
   willAttachConsole: true,
 });
@@ -56,10 +52,10 @@ test("basic smoke test", async ({ apiClient }: WithTestData<MockResources>): Pro
 });
 
 console.log("\nCreating twoPageTest");
-const twoPageTest: TestRunner<WithTestData<MockResources> & { secondPage: MockPage }, string> =
+const twoPageTest: TestRunner<WithTestData<MockResources> & { secondPage: MockPage }> =
   headedTest.extend(
     async (
-      { browser }: Readonly<MockResources>,
+      { browser }: Readonly<WithTestData<MockResources>>,
       { scope }: TestInfo,
     ): Promise<{ secondPage: MockPage }> => ({
       secondPage: await scope.acquire(
@@ -69,7 +65,7 @@ const twoPageTest: TestRunner<WithTestData<MockResources> & { secondPage: MockPa
     }),
   );
 
-twoPageTest.withData("NoSnapshots")(
+twoPageTest.configure({ dataId: "NoSnapshots" })(
   "a second page test",
   async ({
     secondPage,
@@ -81,7 +77,7 @@ twoPageTest.withData("NoSnapshots")(
 );
 
 console.debug("\nRunning tests...\n");
-const results: readonly TestResult[] = await test.run();
+const results: readonly TestResult[] = await suite.run();
 for (const event of events) {
   console.log("event:", event);
 }
